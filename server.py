@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import io
@@ -14,6 +15,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from PIL import Image
 
+
+# ============================================================
+# APPLICATION
+# ============================================================
 
 app = FastAPI(
     title="WaterBoat Hardware Simulator",
@@ -33,20 +38,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 IMAGE_DIR = BASE_DIR / "images"
 
+RENDER_BASE_URL = (
+    "https://waterboat-hardware-simulator.onrender.com"
+)
+
 SUPPORTED_IMAGES = {".jpg", ".jpeg", ".png", ".webp"}
 DEFAULT_INTERVAL = 5.0
 
-# One independent queue per connected stream client.
+# Each connected stream client receives its own queue.
 subscribers: set[asyncio.Queue] = set()
-
-# Used to safely take a consistent snapshot for new stream clients.
 subscriber_lock = asyncio.Lock()
 
 stop_event = asyncio.Event()
@@ -68,7 +76,7 @@ state: dict[str, Any] = {
 
 
 # ============================================================
-# MODELS
+# REQUEST MODELS
 # ============================================================
 
 class Waypoint(BaseModel):
@@ -99,31 +107,41 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def clamp(value: float, minimum: float, maximum: float) -> float:
+def clamp(
+    value: float,
+    minimum: float,
+    maximum: float,
+) -> float:
     return max(minimum, min(maximum, value))
 
 
 def get_images() -> list[Path]:
+    """Return supported camera images from the images directory."""
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     return sorted(
-        p
-        for p in IMAGE_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGES
+        path
+        for path in IMAGE_DIR.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_IMAGES
     )
 
 
-def make_rng(lat: float, lon: float, point_index: int) -> random.Random:
+def make_rng(
+    lat: float,
+    lon: float,
+    point_index: int,
+) -> random.Random:
     return random.Random(
         f"{lat:.7f}:{lon:.7f}:{point_index}"
     )
 
 
-def pollution_factor(point_index: int, total_points: int) -> float:
-    """
-    Smooth synthetic pollution field.
-    It creates believable variation across nearby waypoints.
-    """
+def pollution_factor(
+    point_index: int,
+    total_points: int,
+) -> float:
+    """Generate a synthetic pollution field for survey waypoints."""
 
     if total_points <= 1:
         x = 0.5
@@ -175,7 +193,6 @@ def generate_sensors(
     pollution = pollution_factor(point_index, total_points)
 
     ph = 7.25 - 0.75 * pollution + rng.gauss(0, 0.08)
-
     tds = 260 + 620 * pollution + rng.gauss(0, 22)
 
     turbidity = (
@@ -201,8 +218,12 @@ def generate_sensors(
     return {
         "ph": round(clamp(ph, 5.8, 8.8), 2),
         "tds_ppm": round(clamp(tds, 100, 1400), 1),
-        "turbidity_ntu": round(clamp(turbidity, 0.5, 120), 1),
-        "temperature_c": round(clamp(temperature, 23, 34), 2),
+        "turbidity_ntu": round(
+            clamp(turbidity, 0.5, 120), 1
+        ),
+        "temperature_c": round(
+            clamp(temperature, 23, 34), 2
+        ),
         "dissolved_oxygen_mg_l": round(
             clamp(dissolved_oxygen, 2, 10), 2
         ),
@@ -210,11 +231,7 @@ def generate_sensors(
 
 
 def encode_image(image_path: Path) -> str:
-    """
-    Simulates the ESP32-CAM JPEG payload.
-    The base64 value is stored internally but never dumped
-    by the normal status/measurement APIs.
-    """
+    """Encode a camera image as a simulated ESP32-CAM JPEG payload."""
 
     with Image.open(image_path) as image:
         image = image.convert("RGB")
@@ -243,30 +260,33 @@ def create_measurement(
         )
 
     image_path = images[(point_index - 1) % len(images)]
-
     image_base64 = encode_image(image_path)
+
+    # IMPORTANT:
+    # Use the absolute Render URL so the Vercel frontend
+    # requests the image from the backend, not from Vercel.
+    image_url = (
+        f"{RENDER_BASE_URL}/images/{image_path.name}"
+    )
 
     return {
         "mission_id": mission_id,
         "point_index": point_index,
         "timestamp": now_iso(),
-
         "gps": {
             "latitude": waypoint.lat,
             "longitude": waypoint.lon,
         },
-
         "sensors": generate_sensors(
             waypoint.lat,
             waypoint.lon,
             point_index,
             total_points,
         ),
-
         "camera": {
             "filename": image_path.name,
             "mime_type": "image/jpeg",
-            "image_url": f"/images/{image_path.name}",
+            "image_url": image_url,
 
             # Internal hardware-packet simulation.
             "_image_base64": image_base64,
@@ -281,6 +301,8 @@ def clean_measurement(
     if measurement is None:
         return None
 
+    camera = measurement["camera"]
+
     return {
         "mission_id": measurement["mission_id"],
         "point_index": measurement["point_index"],
@@ -288,20 +310,17 @@ def clean_measurement(
         "gps": measurement["gps"],
         "sensors": measurement["sensors"],
         "camera": {
-            "filename": measurement["camera"]["filename"],
-            "mime_type": measurement["camera"]["mime_type"],
-            "image_url": measurement["camera"]["image_url"],
+            "filename": camera["filename"],
+            "mime_type": camera["mime_type"],
+            "image_url": camera["image_url"],
         },
     }
 
 
-async def broadcast_measurement(measurement: dict[str, Any]) -> None:
-    """
-    Broadcast to EVERY connected stream client.
-
-    This is the important difference from one shared Queue:
-    one client consuming an event cannot steal it from another client.
-    """
+async def broadcast_measurement(
+    measurement: dict[str, Any],
+) -> None:
+    """Broadcast a measurement to every connected stream client."""
 
     data = clean_measurement(measurement)
 
@@ -347,7 +366,6 @@ async def run_mission(mission: Mission) -> None:
 
             state["current_waypoint"] = point_index
 
-            # Simulated hardware reaches waypoint and measures.
             measurement = create_measurement(
                 waypoint=waypoint,
                 mission_id=mission.mission_id,
@@ -359,10 +377,9 @@ async def run_mission(mission: Mission) -> None:
             state["last_measurement"] = measurement
             state["measurements_generated"] += 1
 
-            # Broadcast this measurement to every live stream.
             await broadcast_measurement(measurement)
 
-            # Wait between waypoints.
+            # Wait between waypoint measurements.
             if index < len(mission.waypoints) - 1:
                 try:
                     await asyncio.wait_for(
@@ -371,7 +388,6 @@ async def run_mission(mission: Mission) -> None:
                     )
                 except asyncio.TimeoutError:
                     pass
-
         else:
             state["status"] = "completed"
 
@@ -467,12 +483,11 @@ async def receive_waypoints(mission: Mission):
 
 @app.get("/measurements")
 def get_measurements():
-
     return {
         "count": len(state["measurements"]),
         "measurements": [
-            clean_measurement(m)
-            for m in state["measurements"]
+            clean_measurement(measurement)
+            for measurement in state["measurements"]
         ],
     }
 
@@ -496,55 +511,42 @@ def get_latest_measurement():
 
 
 # ============================================================
-# LIVE SSE STREAM
+# LIVE SERVER-SENT EVENTS STREAM
 # ============================================================
 
 @app.get("/measurements/stream")
 async def measurement_stream():
 
-    # Every client gets its own queue.
     client_queue: asyncio.Queue = asyncio.Queue()
 
-    # IMPORTANT:
-    # Register BEFORE taking the replay snapshot.
-    # Therefore a new measurement cannot be lost between
-    # "snapshot" and "subscribe".
+    # Register before taking the replay snapshot so that
+    # measurements are not missed between snapshot and subscription.
     async with subscriber_lock:
         subscribers.add(client_queue)
 
         replay = [
-            clean_measurement(m)
-            for m in state["measurements"]
+            clean_measurement(measurement)
+            for measurement in state["measurements"]
         ]
 
     async def event_generator():
 
         try:
-            # ------------------------------------------------
-            # Replay measurements already generated.
-            # ------------------------------------------------
-
+            # Replay previously generated measurements.
             for measurement in replay:
                 yield (
                     "event: measurement\n"
                     f"data: {json.dumps(measurement)}\n\n"
                 )
 
-            # ------------------------------------------------
-            # Connection confirmation.
-            # ------------------------------------------------
-
+            # Confirm the stream connection.
             yield (
                 "event: connected\n"
                 'data: {"status":"live"}\n\n'
             )
 
-            # ------------------------------------------------
-            # Live measurements.
-            # ------------------------------------------------
-
+            # Send new measurements as they are generated.
             while True:
-
                 try:
                     measurement = await asyncio.wait_for(
                         client_queue.get(),
@@ -557,10 +559,8 @@ async def measurement_stream():
                     )
 
                 except asyncio.TimeoutError:
-                    # Keep the HTTP connection alive.
-                    yield (
-                        ": keep-alive\n\n"
-                    )
+                    # Keep the stream alive.
+                    yield ": keep-alive\n\n"
 
         except asyncio.CancelledError:
             pass
@@ -581,19 +581,18 @@ async def measurement_stream():
 
 
 # ============================================================
-# IMAGE
+# IMAGE SERVING
 # ============================================================
 
 @app.get("/images/{filename:path}")
 def get_image(filename: str):
 
-    # Resolve safely inside IMAGE_DIR.
+    # Resolve safely inside IMAGE_DIR to prevent path traversal.
     requested = (IMAGE_DIR / filename).resolve()
+    resolved_image_dir = IMAGE_DIR.resolve()
 
     try:
-        requested.relative_to(
-            IMAGE_DIR.resolve()
-        )
+        requested.relative_to(resolved_image_dir)
     except ValueError:
         raise HTTPException(
             status_code=400,
@@ -610,7 +609,7 @@ def get_image(filename: str):
 
 
 # ============================================================
-# STOP
+# STOP SIMULATION
 # ============================================================
 
 @app.post("/stop")
@@ -640,7 +639,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "server:app",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=9000,
         reload=True,
     )
