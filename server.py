@@ -24,6 +24,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://yoloboat.vercel.app",
         "https://ai-enabled-water-pollution-monitori.vercel.app",
         "http://localhost:5173",
     ],
